@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aeso-generation-pipeline"
+version = "0.1.0"
+description = "Local-first ingestion and validation for AESO CSD generation data"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb==1.4.1",
+    "pytz==2025.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.4.2",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
