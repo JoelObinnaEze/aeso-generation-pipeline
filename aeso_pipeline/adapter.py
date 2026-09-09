@@ -12,6 +12,7 @@ class GenerationAdapter(Protocol):
     """Interface a future source-specific generation adapter must implement."""
 
     interval: str
+    schema_version: str
     expected_columns: Sequence[str]
 
     def normalize(
@@ -25,6 +26,7 @@ class AesoCsdHourlyAdapter:
     """Map the observed AESO hourly CSV layout to canonical raw fields."""
 
     interval = "1hour"
+    schema_version = "aeso-csd-hourly-v1"
     expected_columns: tuple[str, ...] = (
         "Date (MST)",
         "Date (MPT)",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -10,6 +11,11 @@ import duckdb
 from aeso_pipeline.adapter import AesoCsdHourlyAdapter
 from aeso_pipeline.models import ProvenanceMetadata
 from aeso_pipeline.pipeline import ingest_file
+from aeso_pipeline.storage import (
+    DATABASE_SCHEMA_VERSION,
+    DatabaseMigrationError,
+    initialize_database,
+)
 from aeso_pipeline.validation import ReasonCode
 
 
@@ -218,3 +224,249 @@ def test_single_csv_zip_is_supported(tmp_path: Path) -> None:
     assert report["clean_row_count"] == 1
     assert report["archive_member"] == "CSD Generation (Hourly) - test.csv"
     assert report["source_sha256"]
+
+
+def test_same_artifact_hash_is_an_explicit_idempotent_noop(tmp_path: Path) -> None:
+    first_source = tmp_path / "original.csv"
+    copied_source = tmp_path / "renamed-copy.csv"
+    db_path = tmp_path / "idempotent.duckdb"
+    _write_csv(first_source, [_row()])
+    shutil.copyfile(first_source, copied_source)
+
+    first = ingest_file(first_source, db_path, _metadata(first_source))
+    replay = ingest_file(copied_source, db_path, _metadata(copied_source))
+
+    assert first["status"] == "loaded"
+    assert replay["status"] == "skipped_idempotent"
+    assert replay["idempotent_replay"] is True
+    assert replay["rows_written"] == 0
+    assert replay["provenance_written"] is False
+    assert replay["batch_id"] == first["batch_id"]
+    assert replay["attempted_batch_id"] != first["attempted_batch_id"]
+    assert replay["source_sha256"] == first["source_sha256"]
+    assert _table_count(db_path, "clean_generation") == 1
+    assert _table_count(db_path, "rejected_rows") == 0
+    assert _table_count(db_path, "provenance") == 1
+
+
+def test_cross_batch_overlap_rejects_incoming_and_keeps_existing(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "first.csv"
+    second_source = tmp_path / "second.csv"
+    db_path = tmp_path / "overlap.duckdb"
+    _write_csv(first_source, [_row(generation="1.25")])
+    _write_csv(
+        second_source,
+        [
+            _row(generation="999.0"),
+            _row(timestamp="2026-06-01 01:00:00", generation="2.5"),
+        ],
+    )
+
+    first = ingest_file(first_source, db_path, _metadata(first_source))
+    second = ingest_file(second_source, db_path, _metadata(second_source))
+
+    assert first["status"] == "loaded"
+    assert second["status"] == "partial"
+    assert second["overlap_policy"] == "reject_incoming"
+    assert second["clean_row_count"] == 1
+    assert second["rejected_row_count"] == 1
+    assert second["reason_counts"] == {
+        ReasonCode.CROSS_BATCH_OVERLAP.value: 1
+    }
+    assert _table_count(db_path, "clean_generation") == 2
+    assert _table_count(db_path, "rejected_rows") == 1
+    assert _table_count(db_path, "provenance") == 2
+
+    with duckdb.connect(str(db_path), read_only=True) as connection:
+        retained = connection.execute(
+            """
+            SELECT generation_mw, source_file
+            FROM clean_generation
+            WHERE asset_id = 'ACD1'
+            ORDER BY timestamp
+            LIMIT 1
+            """
+        ).fetchone()
+        reject = connection.execute(
+            "SELECT reason_code, raw_generation FROM rejected_rows"
+        ).fetchone()
+        policies = connection.execute(
+            """
+            SELECT DISTINCT adapter_schema_version, overlap_policy
+            FROM provenance
+            """
+        ).fetchall()
+    assert retained == (1.25, first_source.name)
+    assert reject == (ReasonCode.CROSS_BATCH_OVERLAP.value, "999.0")
+    assert policies == [(ADAPTER.schema_version, "reject_incoming")]
+
+
+def _create_legacy_database(
+    db_path: Path,
+    *,
+    duplicate_keys: bool = False,
+    duplicate_hashes: bool = False,
+) -> None:
+    with duckdb.connect(str(db_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE clean_generation (
+                timestamp TIMESTAMPTZ NOT NULL,
+                asset_id VARCHAR NOT NULL,
+                asset_name VARCHAR,
+                generation_mw DOUBLE NOT NULL,
+                source_file VARCHAR NOT NULL,
+                source_url VARCHAR NOT NULL,
+                ingested_at TIMESTAMPTZ NOT NULL,
+                source_interval VARCHAR NOT NULL
+            );
+            CREATE TABLE rejected_rows (
+                batch_id VARCHAR NOT NULL,
+                source_line BIGINT,
+                raw_timestamp VARCHAR,
+                raw_asset_id VARCHAR,
+                raw_asset_name VARCHAR,
+                raw_generation VARCHAR,
+                raw_record VARCHAR NOT NULL,
+                reason_code VARCHAR NOT NULL,
+                reason_detail VARCHAR NOT NULL,
+                source_file VARCHAR,
+                source_url VARCHAR,
+                ingested_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE provenance (
+                batch_id VARCHAR PRIMARY KEY,
+                source_file VARCHAR NOT NULL,
+                source_url VARCHAR NOT NULL,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                ingested_at TIMESTAMPTZ NOT NULL,
+                row_count BIGINT NOT NULL,
+                clean_row_count BIGINT NOT NULL,
+                rejected_row_count BIGINT NOT NULL,
+                interval VARCHAR NOT NULL,
+                source_sha256 VARCHAR,
+                archive_member VARCHAR,
+                status VARCHAR NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provenance VALUES
+            ('legacy-1', 'one.csv', 'https://example.test/one', now(), now(),
+             1, 1, 0, '1hour', 'legacy-hash', NULL, 'loaded')
+            """
+        )
+        if duplicate_hashes:
+            connection.execute(
+                """
+                INSERT INTO provenance VALUES
+                ('legacy-2', 'two.csv', 'https://example.test/two', now(), now(),
+                 1, 1, 0, '1hour', 'legacy-hash', NULL, 'loaded')
+                """
+            )
+        if duplicate_keys:
+            connection.execute(
+                """
+                INSERT INTO clean_generation VALUES
+                ('2026-06-01 07:00:00+00', 'ACD1', 'Asset', 1.0,
+                 'one.csv', 'https://example.test/one', now(), '1hour'),
+                ('2026-06-01 07:00:00+00', 'ACD1', 'Asset', 2.0,
+                 'two.csv', 'https://example.test/two', now(), '1hour')
+                """
+            )
+
+
+def test_non_conflicting_legacy_database_migrates_in_place(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.duckdb"
+    _create_legacy_database(db_path)
+
+    initialize_database(db_path)
+
+    with duckdb.connect(str(db_path), read_only=True) as connection:
+        provenance_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info('provenance')"
+            ).fetchall()
+        }
+        version = connection.execute(
+            """
+            SELECT schema_version FROM pipeline_schema
+            WHERE component = 'aeso_pipeline'
+            """
+        ).fetchone()[0]
+        legacy_labels = connection.execute(
+            """
+            SELECT adapter_schema_version, overlap_policy
+            FROM provenance
+            WHERE batch_id = 'legacy-1'
+            """
+        ).fetchone()
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT index_name FROM duckdb_indexes()
+                WHERE index_name LIKE 'uq_%'
+                """
+            ).fetchall()
+        }
+    assert {"adapter_schema_version", "overlap_policy"} <= provenance_columns
+    assert version == DATABASE_SCHEMA_VERSION
+    assert legacy_labels == ("legacy-unversioned", "legacy-unenforced")
+    assert indexes == {
+        "uq_clean_generation_key",
+        "uq_provenance_source_sha256",
+    }
+
+
+def test_conflicting_legacy_database_refuses_automatic_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-overlap.duckdb"
+    _create_legacy_database(db_path, duplicate_keys=True)
+
+    try:
+        initialize_database(db_path)
+    except DatabaseMigrationError as exc:
+        assert "will not guess" in str(exc)
+    else:
+        raise AssertionError("conflicting legacy database should not migrate")
+
+
+def test_repeated_legacy_source_hash_refuses_automatic_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-repeated-hash.duckdb"
+    _create_legacy_database(db_path, duplicate_hashes=True)
+
+    try:
+        initialize_database(db_path)
+    except DatabaseMigrationError as exc:
+        assert "repeated source hashes" in str(exc)
+    else:
+        raise AssertionError("repeated legacy source hashes should not migrate")
+
+
+def test_newer_database_schema_refuses_downgrade(tmp_path: Path) -> None:
+    db_path = tmp_path / "future.duckdb"
+    initialize_database(db_path)
+    with duckdb.connect(str(db_path)) as connection:
+        connection.execute(
+            """
+            UPDATE pipeline_schema
+            SET schema_version = ?
+            WHERE component = 'aeso_pipeline'
+            """,
+            [DATABASE_SCHEMA_VERSION + 1],
+        )
+
+    try:
+        initialize_database(db_path)
+    except DatabaseMigrationError as exc:
+        assert "newer than this component" in str(exc)
+    else:
+        raise AssertionError("a newer database schema should not be downgraded")

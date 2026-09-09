@@ -24,7 +24,9 @@ class RawInputError(ValueError):
     """Raised when an input container cannot yield one CSV stream."""
 
 
-def _sha256(path: Path) -> str:
+def calculate_sha256(path: Path) -> str:
+    """Return the content fingerprint used as the artifact idempotency key."""
+
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -63,7 +65,11 @@ def _open_text(path: Path) -> Iterator[tuple[TextIO, str | None]]:
         raise RawInputError("input is not a readable ZIP archive") from exc
 
 
-def read_csv_batch(path: Path) -> RawCsvBatch:
+def read_csv_batch(
+    path: Path,
+    *,
+    source_sha256: str | None = None,
+) -> RawCsvBatch:
     with _open_text(path) as (stream, member):
         reader = csv.reader(stream, strict=True)
         try:
@@ -77,7 +83,6 @@ def read_csv_batch(path: Path) -> RawCsvBatch:
     return RawCsvBatch(
         header=header,
         rows=rows,
-        source_sha256=_sha256(path),
+        source_sha256=source_sha256 or calculate_sha256(path),
         archive_member=member,
     )
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from aeso_pipeline.adapter import AesoCsdHourlyAdapter
+from aeso_pipeline.models import CrossBatchOverlapPolicy
 from aeso_pipeline.validation import (
     ReasonCode,
     malformed_row_issue,
@@ -10,6 +11,7 @@ from aeso_pipeline.validation import (
     parse_timestamp,
     validate_asset_identifier,
     validate_column_structure,
+    validate_cross_batch_overlap,
     validate_duplicate_record,
     validate_file_not_empty,
     validate_provenance,
@@ -54,6 +56,19 @@ def test_duplicate_asset_timestamp_has_specific_reason() -> None:
     assert issue.code is ReasonCode.DUPLICATE_RECORD
 
 
+def test_cross_batch_overlap_has_specific_reason() -> None:
+    timestamp = datetime(2026, 6, 1, tzinfo=UTC)
+    issue = validate_cross_batch_overlap(
+        "ACD1",
+        timestamp,
+        {("ACD1", timestamp): "earlier.csv"},
+        CrossBatchOverlapPolicy.REJECT_INCOMING,
+    )
+    assert issue is not None
+    assert issue.code is ReasonCode.CROSS_BATCH_OVERLAP
+    assert "existing_source_file='earlier.csv'" in issue.detail
+
+
 def test_wrong_column_order_has_specific_reason() -> None:
     expected = ("timestamp", "asset", "volume")
     issue = validate_column_structure(
@@ -93,4 +108,3 @@ def test_valid_generation_is_finite_float() -> None:
     parsed, issue = parse_generation("-0.25")
     assert issue is None
     assert parsed == -0.25
-

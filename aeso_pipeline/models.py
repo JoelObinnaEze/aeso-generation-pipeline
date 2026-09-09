@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+
+class CrossBatchOverlapPolicy(StrEnum):
+    """Supported behavior when an incoming key already exists in DuckDB."""
+
+    REJECT_INCOMING = "reject_incoming"
 
 
 @dataclass(frozen=True)
@@ -16,6 +23,19 @@ class ProvenanceMetadata:
     source_url: str | None
     retrieved_at: datetime | None
     interval: str | None
+
+
+@dataclass(frozen=True)
+class ExistingBatch:
+    """A previously committed batch found by its source artifact hash."""
+
+    batch_id: str
+    row_count: int
+    clean_row_count: int
+    rejected_row_count: int
+    status: str
+    ingested_at: datetime
+    archive_member: str | None
 
 
 @dataclass(frozen=True)
@@ -77,4 +97,3 @@ class BatchResult:
         for record in self.rejected_records:
             counts[record.reason_code] = counts.get(record.reason_code, 0) + 1
         return dict(sorted(counts.items()))
-

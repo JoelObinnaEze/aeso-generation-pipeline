@@ -50,15 +50,17 @@ The small file in `data/sample/` preserves that observed header and a few repres
 ```text
 CSV or one-CSV ZIP
   -> raw reader + SHA-256
+  -> source-hash idempotency check
   -> AESO CSD hourly adapter
   -> generic named validators
+  -> reject-incoming cross-batch overlap check
   -> valid / rejected split
   -> atomic DuckDB write
   -> JSON validation report
 ```
 
 - `aeso_pipeline/readers.py` handles containers and raw CSV rows.
-- `aeso_pipeline/adapter.py` is the only component that knows AESO's raw field names and MST timestamp meaning. `GenerationAdapter` defines the extension interface.
+- `aeso_pipeline/adapter.py` is the only component that knows AESO's raw field names, MST timestamp meaning, and adapter schema version. `GenerationAdapter` defines the extension interface.
 - `aeso_pipeline/validation.py` contains small dataset-independent validation functions and stable reason codes.
 - `aeso_pipeline/pipeline.py` applies deterministic validation order and quarantine behavior.
 - `aeso_pipeline/storage.py` owns the DuckDB schema and transactional bulk persistence.
@@ -104,9 +106,22 @@ Stores `batch_id`, source line, best-effort raw timestamp/asset/name/generation 
 
 ### `provenance`
 
-One row per batch for which all required metadata was supplied: `batch_id`, filename, URL, retrieval and ingestion timestamps, input/clean/rejected counts, interval, SHA-256, ZIP member name, and final status.
+One row per committed batch for which all required metadata was supplied: `batch_id`, filename, URL, retrieval and ingestion timestamps, input/clean/rejected counts, interval, SHA-256, ZIP member name, final status, `adapter_schema_version`, and `overlap_policy`.
 
-`loaded` means no rejects, `partial` means clean and rejected records both exist, and `rejected` means no record was accepted. Missing provenance is represented in `rejected_rows`; deliberately, no incomplete provenance row is fabricated.
+`loaded` means no rejects, `partial` means clean and rejected records both exist, and `rejected` means no record was accepted. Missing provenance is represented in `rejected_rows`; deliberately, no incomplete provenance row is fabricated. `pipeline_schema` records the local database schema version.
+
+## Repeatable batch semantics
+
+Artifact idempotency is keyed by the SHA-256 of the exact input bytes. Before parsing a known artifact, the pipeline checks `provenance`; a replay returns `status: skipped_idempotent`, the original batch information, `rows_written: 0`, and `provenance_written: false`. A unique database index provides a final enforcement boundary, so renaming or copying an identical file does not bypass idempotency.
+
+Different artifacts can still contain the same `(asset_id, timestamp)`. The explicit policy is `reject_incoming`:
+
+- the previously committed clean observation remains unchanged;
+- each incoming overlap is quarantined with `CROSS_BATCH_OVERLAP`;
+- non-overlapping rows in the same incoming batch continue to `clean_generation`;
+- the policy and adapter schema version are recorded in provenance and the JSON report.
+
+The CLI exposes `--overlap-policy reject_incoming`. It is currently the only supported policy so that corrected/revised AESO publications cannot overwrite history without a separately designed correction workflow.
 
 ## Deterministic validation
 
@@ -117,12 +132,13 @@ One row per batch for which all required metadata was supplied: `batch_id`, file
 | `MISSING_ASSET_ID` | Unit identifier is null, empty, or whitespace | Quarantine row |
 | `NON_NUMERIC_GENERATION` | Volume is blank, nonnumeric, NaN, or infinite | Quarantine row |
 | `DUPLICATE_RECORD` | Repeated `(asset_id, timestamp)` in one input | Keep first; quarantine later occurrence |
+| `CROSS_BATCH_OVERLAP` | A different artifact contains a key already in `clean_generation` | Keep existing; quarantine incoming row |
 | `WRONG_COLUMN_STRUCTURE` | Header count/order differs, or a row has the wrong field count | Quarantine row or reject structurally invalid batch |
 | `EMPTY_FILE` | The file has no header at all | Reject batch and still record provenance |
 | `OTHER_MALFORMED_ROW` | CSV/container/adapter exception not covered above | Quarantine with exception type and message |
 | `MISSING_PROVENANCE_METADATA` | Filename, URL, retrieval time, or interval is absent | Reject batch; do not write an incomplete provenance row |
 
-For a structurally valid row, precedence is timestamp missing, timestamp invalid, asset missing, generation invalid, then duplicate. One stable reason is assigned per rejected row, so aggregate reports do not change according to incidental validator ordering.
+For a structurally valid row, precedence is timestamp missing, timestamp invalid, asset missing, generation invalid, within-batch duplicate, then cross-batch overlap. Exact-artifact idempotency is evaluated before row validation. One stable reason is assigned per rejected row, so aggregate reports do not change according to incidental validator ordering.
 
 Negative finite generation is accepted. It can be meaningful operationally, and imposing a physical range would exceed the documented validation scope.
 
@@ -134,7 +150,13 @@ Run:
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The suite has one focused test for every required failure type, plus integration tests for a fully valid batch, a mixed-quality split, batch-level structural failures, missing provenance, timezone normalization, quoted comma-containing values, and direct ZIP ingestion. Synthetic fixtures trigger the failures independently; correctness does not depend on the real month being dirty.
+The suite has one focused test for every required failure type, plus integration tests for a fully valid batch, a mixed-quality split, exact-artifact replay, cross-batch overlap, safe legacy migration, migration refusal on ambiguous legacy data, timezone normalization, quoted comma-containing values, and direct ZIP ingestion. Synthetic fixtures trigger the failures independently; correctness does not depend on the real month being dirty.
+
+GitHub Actions runs the full suite from a clean checkout on Python 3.11 and 3.13 for every push and pull request. See `.github/workflows/ci.yml`.
+
+## Upstream schema compatibility
+
+The current exact source contract is identified as `aeso-csd-hourly-v1`. Additive, removed, renamed, reordered, or semantically changed upstream fields fail closed rather than being guessed. The versioning procedure, compatibility matrix, and local DuckDB migration guarantees are documented in [SCHEMA_COMPATIBILITY.md](SCHEMA_COMPATIBILITY.md).
 
 ## Data-quality assumption
 
@@ -151,7 +173,8 @@ GROUP BY reason_code
 ORDER BY reason_code;
 
 SELECT source_file, retrieved_at, row_count, clean_row_count,
-       rejected_row_count, source_sha256, status
+       rejected_row_count, source_sha256, adapter_schema_version,
+       overlap_policy, status
 FROM provenance
 ORDER BY ingested_at DESC;
 
@@ -163,7 +186,7 @@ HAVING count(*) > 1;
 
 ## Known boundaries
 
-- Duplicate detection is within the current input batch; source-hash idempotency and cross-batch overlap policy are reasonable next steps.
 - The bounded file is normalized in memory before bulk persistence. For many months or five-minute data, process chunks while retaining the same validation functions.
-- Remote download, credential handling, scheduling, schema evolution, physical plausibility thresholds, and settlement reconciliation are intentionally not included.
+- `reject_incoming` preserves history but does not implement a corrected-publication replacement workflow; that requires explicit domain authorization and version semantics.
+- Remote download, credential handling, scheduling, automatic schema adaptation, physical plausibility thresholds, and settlement reconciliation are intentionally not included.
 - The adapter fails closed on header changes. That makes source drift visible instead of silently mis-mapping columns.

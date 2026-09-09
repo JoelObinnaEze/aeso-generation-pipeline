@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Callable, Mapping, MutableSet, Sequence
 
+from .models import CrossBatchOverlapPolicy
+
 
 class ReasonCode(StrEnum):
     MISSING_TIMESTAMP = "MISSING_TIMESTAMP"
@@ -15,6 +17,7 @@ class ReasonCode(StrEnum):
     MISSING_ASSET_ID = "MISSING_ASSET_ID"
     NON_NUMERIC_GENERATION = "NON_NUMERIC_GENERATION"
     DUPLICATE_RECORD = "DUPLICATE_RECORD"
+    CROSS_BATCH_OVERLAP = "CROSS_BATCH_OVERLAP"
     WRONG_COLUMN_STRUCTURE = "WRONG_COLUMN_STRUCTURE"
     EMPTY_FILE = "EMPTY_FILE"
     OTHER_MALFORMED_ROW = "OTHER_MALFORMED_ROW"
@@ -90,6 +93,27 @@ def validate_duplicate_record(
         )
     seen_keys.add(key)
     return None
+
+
+def validate_cross_batch_overlap(
+    asset_id: str,
+    timestamp: datetime,
+    existing_keys: Mapping[tuple[str, datetime], str],
+    policy: CrossBatchOverlapPolicy,
+) -> ValidationIssue | None:
+    """Apply the explicit policy for a key already committed by another batch."""
+
+    key = (asset_id, timestamp)
+    if key not in existing_keys:
+        return None
+    if policy is CrossBatchOverlapPolicy.REJECT_INCOMING:
+        existing_source = existing_keys[key]
+        return ValidationIssue(
+            ReasonCode.CROSS_BATCH_OVERLAP,
+            "incoming (asset_id, timestamp) overlaps an existing batch; "
+            f"policy=reject_incoming; existing_source_file={existing_source!r}",
+        )
+    raise ValueError(f"unsupported cross-batch overlap policy: {policy}")
 
 
 def validate_column_structure(

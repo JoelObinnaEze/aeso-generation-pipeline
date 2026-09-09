@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .adapter import AesoCsdHourlyAdapter
-from .models import ProvenanceMetadata
+from .models import CrossBatchOverlapPolicy, ProvenanceMetadata
 from .pipeline import ingest_file
 
 
@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_retrieved_at,
         help="ISO-8601 retrieval time; defaults to the input file modification time",
     )
+    parser.add_argument(
+        "--overlap-policy",
+        choices=[policy.value for policy in CrossBatchOverlapPolicy],
+        default=CrossBatchOverlapPolicy.REJECT_INCOMING.value,
+        help="Cross-batch key policy (default: reject_incoming)",
+    )
     return parser
 
 
@@ -76,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         metadata,
         report_path=report_path,
         adapter=adapter,
+        overlap_policy=CrossBatchOverlapPolicy(args.overlap_policy),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -83,4 +90,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
