@@ -15,6 +15,10 @@ All notable changes to this project are documented here.
 - CI now validates editable package installation and both command-line entry points.
 - Setuptools package discovery is explicit so local data directories cannot be mistaken for Python packages.
 
+### Security
+
+- Upgraded DuckDB to 1.4.2 to include the upstream encryption implementation security fixes.
+
 ## [0.2.0] - 2026-09-09
 
 ### Added

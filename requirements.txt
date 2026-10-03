@@ -1,5 +1,5 @@
 colorama==0.4.6
-duckdb==1.4.1
+duckdb==1.4.2
 iniconfig==2.3.0
 packaging==26.3
 pluggy==1.6.0
