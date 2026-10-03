@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [0.3.0] - 2026-10-02
+## [0.3.0] - 2026-10-03
 
 ### Added
 
@@ -18,6 +18,7 @@ All notable changes to this project are documented here.
 ### Security
 
 - Upgraded DuckDB to 1.4.2 to include the upstream encryption implementation security fixes.
+- Upgraded pytest to 9.0.3 to address the upstream temporary-file cleanup advisory.
 
 ## [0.2.0] - 2026-09-09
 
