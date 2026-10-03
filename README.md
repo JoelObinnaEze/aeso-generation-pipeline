@@ -1,170 +1,160 @@
-# AESO CSD generation pipeline
+# AESO Generation Data Pipeline
 
-A small, local-first ingestion and validation component for the Alberta Electric System Operator (AESO) Historical Generation Data (CSD) dataset. It accepts one hourly CSV or AESO ZIP archive, normalizes the observed source layout, quarantines invalid records, records file-level provenance, and writes a JSON validation report plus one DuckDB database.
+[![CI](https://github.com/JoelObinnaEze/aeso-generation-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/JoelObinnaEze/aeso-generation-pipeline/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![DuckDB 1.4](https://img.shields.io/badge/DuckDB-1.4-FFF000?logo=duckdb&logoColor=black)
 
-The component is intentionally bounded: it handles one local hourly input at a time and does not download, schedule, reconcile, or visualize the wider historical archive.
+A production-minded Python ingestion component for the Alberta Electric System Operator (AESO) Current Supply and Demand historical generation dataset. It turns one hourly CSV or ZIP artifact into validated, queryable DuckDB tables with deterministic quarantine, file-level provenance, schema-version tracking, and replay-safe batch semantics.
 
-## Reproduce it
+> **Verified full-month run:** 165,168 hourly observations across 230 assets, with 0 rejected rows and 0 duplicate `(asset_id, timestamp)` keys from the June 2026 AESO archive.
 
-Python 3.11 or newer is required. From the repository root:
+## Engineering highlights
+
+| Concern | Implementation |
+|---|---|
+| Repeatable ingestion | SHA-256 source identity makes an exact replay an explicit zero-write no-op |
+| Cross-batch consistency | Existing observations win; incoming overlaps are quarantined under `reject_incoming` |
+| Data quality | Stable reason codes, raw-record retention, and one deterministic rejection reason per row |
+| Auditability | Source URL, retrieval time, hash, adapter version, policy, counts, and status are persisted |
+| Schema drift | Exact versioned source contract fails closed instead of guessing at renamed or reordered fields |
+| Storage safety | Clean rows, rejects, and provenance commit in one DuckDB transaction with uniqueness guards |
+| Delivery quality | 27 automated tests plus clean-checkout CI on Python 3.11 and 3.13 |
+
+This is intentionally a focused ingestion boundary, not a dashboard or forecasting project. The goal is to make operational source data trustworthy before downstream analysis begins.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Hourly CSV or ZIP] --> B[Reader + SHA-256]
+    B --> C{Hash already committed?}
+    C -->|Yes| D[Explicit idempotent no-op]
+    C -->|No| E[AESO v1 adapter]
+    E --> F[Named validators]
+    F -->|Invalid| G[Rejected rows]
+    F -->|Valid| H{Key already committed?}
+    H -->|Yes| G
+    H -->|No| I[Clean generation]
+    G --> J[(Atomic DuckDB transaction)]
+    I --> J
+    J --> K[Provenance + JSON report]
+```
+
+The source-specific contract lives in the adapter. Reading, canonical validation, orchestration, storage, and inspection remain separate so each boundary can be tested independently.
+
+## Quick start
+
+Python 3.11 or newer is required.
 
 ```powershell
+git clone https://github.com/JoelObinnaEze/aeso-generation-pipeline.git
+cd aeso-generation-pipeline
+
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe -m aeso_pipeline.run --input data\sample\aeso_hourly_sample.csv --db data\aeso.duckdb
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+
+python -m pytest
+aeso-ingest --input data\sample\aeso_hourly_sample.csv --db data\aeso.duckdb
+aeso-inspect --db data\aeso.duckdb
 ```
 
-`requirements.txt` pins the complete runtime/test dependency set, including transitive packages used by pytest and DuckDB's timezone conversion.
+On macOS or Linux, activate with `source .venv/bin/activate` and use forward slashes in paths.
 
-The final line is the single reproducible pipeline command. It creates:
+The sample command creates two ignored local artifacts:
 
-- `data/aeso.duckdb`, containing `clean_generation`, `rejected_rows`, and `provenance`;
-- `data/aeso.validation.json`, containing counts, status, reason-code totals, file hash, and source metadata.
+- `data/aeso.duckdb` with clean, rejected, provenance, and schema-version tables;
+- `data/aeso.validation.json` with batch counts, status, reason totals, policy, and source identity.
 
-The downloaded AESO ZIP can be used directly, without manually extracting it:
+The inspection command is read-only and returns stable JSON suitable for a terminal demo or automated health check:
+
+```json
+{
+  "batch_count": 1,
+  "clean_row_count": 165168,
+  "database_schema_version": 2,
+  "distinct_asset_count": 230,
+  "duplicate_key_group_count": 0,
+  "rejected_row_count": 0
+}
+```
+
+## Run the real AESO archive
+
+Download an hourly ZIP from the official [AESO Historical Generation Data (CSD)](https://www.aeso.ca/market/market-and-system-reporting/data-requests/historical-generation-data/) page and place it under `data/raw/`. The pipeline reads the ZIP directly; manual extraction is unnecessary.
 
 ```powershell
-.\.venv\Scripts\python.exe -m aeso_pipeline.run `
+aeso-ingest `
   --input "data\raw\CSD Generation (Hourly) - 2026-06.zip" `
-  --db data\aeso.duckdb `
-  --source-url "https://aeso.box.com/s/qofgn9axnnw6uq3ip1goiq2ngb11txe5/file/2331073528682"
+  --db data\aeso-full.duckdb
+
+aeso-inspect --db data\aeso-full.duckdb
 ```
 
-On macOS/Linux, replace `.\.venv\Scripts\python.exe` with `.venv/bin/python` and use forward slashes in paths.
+`--retrieved-at` accepts an offset-aware ISO-8601 timestamp. If omitted, the input file modification time is recorded as the best local retrieval-time approximation. `--source-url`, `--report`, and `--overlap-policy` are also explicit CLI options.
 
-`--retrieved-at` optionally accepts an offset-aware ISO-8601 timestamp. If omitted, the input file's modification time is used as the best local approximation of retrieval time. `--report` overrides the default report path.
+## Source contract
 
-## Real source inspection
-
-The adapter was written after inspecting the real `CSD Generation (Hourly) - 2026-06.zip` archive from the [AESO public Box folder](https://aeso.box.com/s/qofgn9axnnw6uq3ip1goiq2ngb11txe5/folder/196178549071). The archive contains one 18.69 MB CSV with this exact ordered header:
+The `aeso-csd-hourly-v1` adapter was built against the observed 12-column AESO hourly layout:
 
 ```text
 Date (MST),Date (MPT),Asset Short Name,Asset Name,Asset Grouping,Volume,Maximum Capability,System Capability,Fuel Type,Sub Fuel Type,Planning Area,Region
 ```
 
-The small file in `data/sample/` preserves that observed header and a few representative public rows. The full source archive is deliberately not committed.
-
-## Flow and separation of concerns
-
-```text
-CSV or one-CSV ZIP
-  -> raw reader + SHA-256
-  -> source-hash idempotency check
-  -> AESO CSD hourly adapter
-  -> generic named validators
-  -> reject-incoming cross-batch overlap check
-  -> valid / rejected split
-  -> atomic DuckDB write
-  -> JSON validation report
-```
-
-- `aeso_pipeline/readers.py` handles containers and raw CSV rows.
-- `aeso_pipeline/adapter.py` is the only component that knows AESO's raw field names, MST timestamp meaning, and adapter schema version. `GenerationAdapter` defines the extension interface.
-- `aeso_pipeline/validation.py` contains small dataset-independent validation functions and stable reason codes.
-- `aeso_pipeline/pipeline.py` applies deterministic validation order and quarantine behavior.
-- `aeso_pipeline/storage.py` owns the DuckDB schema and transactional bulk persistence.
-- `aeso_pipeline/run.py` provides the CLI and constructs complete provenance metadata.
-
-A future load, price, intertie, or outage adapter can implement the same adapter interface without rewriting the validators or persistence layer.
-
-## Raw-to-clean mapping
-
-| Observed raw column | Clean column | Rule |
+| Raw field | Clean field | Rule |
 |---|---|---|
-| `Date (MST)` | `timestamp` | Parse exact `YYYY-MM-DD HH:MM:SS` as fixed UTC-07:00, then store the absolute instant as `TIMESTAMPTZ` |
-| `Asset Short Name` | `asset_id` | Trim surrounding whitespace; blank is rejected |
-| `Asset Name` | `asset_name` | Trim surrounding whitespace; blank becomes `NULL` |
-| `Volume` | `generation_mw` | Parse as finite `DOUBLE`; text, blank, NaN, and infinity are rejected |
-| input filename | `source_file` | Supplied by the CLI |
-| `--source-url` | `source_url` | Defaults to the official hourly Box folder |
-| pipeline clock | `ingested_at` | Offset-aware UTC batch timestamp |
-| adapter | `source_interval` | Literal `1hour` |
+| `Date (MST)` | `timestamp` | Parse exact `YYYY-MM-DD HH:MM:SS` at fixed UTC-07:00, then store as `TIMESTAMPTZ` |
+| `Asset Short Name` | `asset_id` | Trim whitespace; reject blank identifiers |
+| `Asset Name` | `asset_name` | Trim whitespace; convert blank values to `NULL` |
+| `Volume` | `generation_mw` | Parse a finite `DOUBLE`; reject blank, text, NaN, and infinity |
 
-`Date (MST)` is used instead of the naive `Date (MPT)` value because MST is a fixed offset. This avoids daylight-saving ambiguity while preserving the source's stated time basis. DuckDB stores an absolute instant; display timezone depends on the DuckDB session. Run `SET TimeZone = 'UTC';` when UTC rendering is desired.
+The fixed-offset MST field is used instead of the naive MPT clock to avoid daylight-saving ambiguity. DuckDB stores an absolute instant; display timezone depends on the SQL session.
 
-The other source columns are intentionally outside the narrow clean target. A rejected record retains all raw fields as JSON so it can be diagnosed without reopening the source.
+## Deterministic validation and quarantine
 
-## DuckDB tables
-
-### `clean_generation`
-
-| Column | DuckDB type |
-|---|---|
-| `timestamp` | `TIMESTAMPTZ` |
-| `asset_id` | `VARCHAR` |
-| `asset_name` | `VARCHAR` |
-| `generation_mw` | `DOUBLE` |
-| `source_file` | `VARCHAR` |
-| `source_url` | `VARCHAR` |
-| `ingested_at` | `TIMESTAMPTZ` |
-| `source_interval` | `VARCHAR` |
-
-### `rejected_rows`
-
-Stores `batch_id`, source line, best-effort raw timestamp/asset/name/generation values, the full raw record as JSON text, one `reason_code`, explanatory detail, source metadata, and ingestion time. Nothing invalid is silently discarded.
-
-### `provenance`
-
-One row per committed batch for which all required metadata was supplied: `batch_id`, filename, URL, retrieval and ingestion timestamps, input/clean/rejected counts, interval, SHA-256, ZIP member name, final status, `adapter_schema_version`, and `overlap_policy`.
-
-`loaded` means no rejects, `partial` means clean and rejected records both exist, and `rejected` means no record was accepted. Missing provenance is represented in `rejected_rows`; deliberately, no incomplete provenance row is fabricated. `pipeline_schema` records the local database schema version.
-
-## Repeatable batch semantics
-
-Artifact idempotency is keyed by the SHA-256 of the exact input bytes. Before parsing a known artifact, the pipeline checks `provenance`; a replay returns `status: skipped_idempotent`, the original batch information, `rows_written: 0`, and `provenance_written: false`. A unique database index provides a final enforcement boundary, so renaming or copying an identical file does not bypass idempotency.
-
-Different artifacts can still contain the same `(asset_id, timestamp)`. The explicit policy is `reject_incoming`:
-
-- the previously committed clean observation remains unchanged;
-- each incoming overlap is quarantined with `CROSS_BATCH_OVERLAP`;
-- non-overlapping rows in the same incoming batch continue to `clean_generation`;
-- the policy and adapter schema version are recorded in provenance and the JSON report.
-
-The CLI exposes `--overlap-policy reject_incoming`. It is currently the only supported policy so that corrected/revised AESO publications cannot overwrite history without a separately designed correction workflow.
-
-## Deterministic validation
-
-| Reason code | Trigger | Handling |
+| Reason code | Trigger | Result |
 |---|---|---|
-| `MISSING_TIMESTAMP` | Timestamp is null, empty, or whitespace | Quarantine row |
-| `INVALID_TIMESTAMP` | Nonblank timestamp fails the adapter parser | Quarantine row |
-| `MISSING_ASSET_ID` | Unit identifier is null, empty, or whitespace | Quarantine row |
+| `MISSING_TIMESTAMP` | Timestamp is empty | Quarantine row |
+| `INVALID_TIMESTAMP` | Timestamp cannot be parsed | Quarantine row |
+| `MISSING_ASSET_ID` | Asset identifier is empty | Quarantine row |
 | `NON_NUMERIC_GENERATION` | Volume is blank, nonnumeric, NaN, or infinite | Quarantine row |
-| `DUPLICATE_RECORD` | Repeated `(asset_id, timestamp)` in one input | Keep first; quarantine later occurrence |
-| `CROSS_BATCH_OVERLAP` | A different artifact contains a key already in `clean_generation` | Keep existing; quarantine incoming row |
-| `WRONG_COLUMN_STRUCTURE` | Header count/order differs, or a row has the wrong field count | Quarantine row or reject structurally invalid batch |
-| `EMPTY_FILE` | The file has no header at all | Reject batch and still record provenance |
-| `OTHER_MALFORMED_ROW` | CSV/container/adapter exception not covered above | Quarantine with exception type and message |
-| `MISSING_PROVENANCE_METADATA` | Filename, URL, retrieval time, or interval is absent | Reject batch; do not write an incomplete provenance row |
+| `DUPLICATE_RECORD` | Key repeats inside one artifact | Keep first; quarantine later occurrence |
+| `CROSS_BATCH_OVERLAP` | A different artifact repeats a committed key | Keep existing; quarantine incoming row |
+| `WRONG_COLUMN_STRUCTURE` | Header or row shape differs from the contract | Quarantine row or reject batch |
+| `EMPTY_FILE` | No CSV header exists | Reject batch and preserve provenance |
+| `OTHER_MALFORMED_ROW` | CSV, ZIP, or adapter error | Quarantine with diagnostic detail |
+| `MISSING_PROVENANCE_METADATA` | Required source metadata is absent | Reject without fabricating provenance |
 
-For a structurally valid row, precedence is timestamp missing, timestamp invalid, asset missing, generation invalid, within-batch duplicate, then cross-batch overlap. Exact-artifact idempotency is evaluated before row validation. One stable reason is assigned per rejected row, so aggregate reports do not change according to incidental validator ordering.
+Rejected records preserve their source line, best-effort canonical fields, full raw record as JSON, reason code, explanation, source metadata, and ingestion time. Invalid input is never silently discarded.
 
-Negative finite generation is accepted. It can be meaningful operationally, and imposing a physical range would exceed the documented validation scope.
+## Repeatable batch behavior
 
-## Tests
+### Exact artifact replay
 
-Run:
+SHA-256 is calculated before parsing. If that hash already exists in committed provenance, the run returns `status: skipped_idempotent`, references the original batch, and writes zero clean, rejected, or provenance rows. A unique index enforces the same guarantee at the storage boundary.
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest
-```
+### Different artifact, overlapping key
 
-The suite has one focused test for every required failure type, plus integration tests for a fully valid batch, a mixed-quality split, exact-artifact replay, cross-batch overlap, safe legacy migration, migration refusal on ambiguous legacy data, timezone normalization, quoted comma-containing values, and direct ZIP ingestion. Synthetic fixtures trigger the failures independently; correctness does not depend on the real month being dirty.
+For a different hash containing an existing `(asset_id, timestamp)`, the explicit policy is `reject_incoming`:
 
-GitHub Actions runs the full suite from a clean checkout on Python 3.11 and 3.13 for every push and pull request. See `.github/workflows/ci.yml`.
+- the existing clean observation remains unchanged;
+- the incoming conflict receives `CROSS_BATCH_OVERLAP`;
+- non-overlapping rows in the same artifact can still load;
+- the selected policy is recorded in both provenance and the JSON report.
 
-## Upstream schema compatibility
+This preserves history without inventing corrected-publication semantics that AESO has not supplied.
 
-The current exact source contract is identified as `aeso-csd-hourly-v1`. Additive, removed, renamed, reordered, or semantically changed upstream fields fail closed rather than being guessed. The versioning procedure, compatibility matrix, and local DuckDB migration guarantees are documented in [SCHEMA_COMPATIBILITY.md](SCHEMA_COMPATIBILITY.md).
+## DuckDB model
 
-## Data-quality assumption
+| Table | Purpose |
+|---|---|
+| `clean_generation` | Canonical timestamp, asset, MW value, and source lineage |
+| `rejected_rows` | Raw failed records plus stable reason codes and diagnostics |
+| `provenance` | One row per committed artifact with counts, hash, versions, and policy |
+| `pipeline_schema` | Local database schema version used for safe migration checks |
 
-> The pipeline treats the generation values published in the AESO CSD dataset as the source-of-record observations for ingestion and validation. It does not attempt to reconcile them against settlement-meter data.
-
-AESO describes CSD data as generally representative of unit generation but distinct from, and lower quality than, settlement-meter data. For this bounded component, the defensible checks are structure, type, provenance, uniqueness, and internal consistency. Claiming that every numeric observation is physically correct would require a different authoritative dataset and reconciliation rules, both out of scope. See [ASSUMPTIONS.md](ASSUMPTIONS.md).
-
-## Useful queries
+Example audit queries:
 
 ```sql
 SELECT reason_code, count(*)
@@ -172,9 +162,8 @@ FROM rejected_rows
 GROUP BY reason_code
 ORDER BY reason_code;
 
-SELECT source_file, retrieved_at, row_count, clean_row_count,
-       rejected_row_count, source_sha256, adapter_schema_version,
-       overlap_policy, status
+SELECT source_file, row_count, clean_row_count, rejected_row_count,
+       source_sha256, adapter_schema_version, overlap_policy, status
 FROM provenance
 ORDER BY ingested_at DESC;
 
@@ -184,9 +173,30 @@ GROUP BY asset_id, timestamp
 HAVING count(*) > 1;
 ```
 
-## Known boundaries
+## Project layout
 
-- The bounded file is normalized in memory before bulk persistence. For many months or five-minute data, process chunks while retaining the same validation functions.
-- `reject_incoming` preserves history but does not implement a corrected-publication replacement workflow; that requires explicit domain authorization and version semantics.
-- Remote download, credential handling, scheduling, automatic schema adaptation, physical plausibility thresholds, and settlement reconciliation are intentionally not included.
-- The adapter fails closed on header changes. That makes source drift visible instead of silently mis-mapping columns.
+```text
+aeso_pipeline/
+  adapter.py      AESO schema mapping and timestamp semantics
+  readers.py      CSV/ZIP handling and source hashing
+  validation.py   Dataset-independent validators and reason codes
+  pipeline.py     Batch orchestration and deterministic precedence
+  storage.py      DuckDB schema, migrations, lookups, and transactions
+  inspect.py      Read-only operational database summary
+  run.py          Ingestion CLI
+tests/             Focused unit and integration tests
+data/sample/       Small public-schema fixture; full archives stay local
+```
+
+## Verification and compatibility
+
+GitHub Actions installs the package from a clean checkout, smoke-tests both CLIs, and runs the complete suite on Python 3.11 and 3.13 for every push and pull request. Tests cover every rejection reason plus valid, mixed, ZIP, idempotent replay, overlap, timezone, migration, and inspection paths.
+
+Upstream schema changes fail closed. The compatibility matrix and adapter migration procedure are in [SCHEMA_COMPATIBILITY.md](SCHEMA_COMPATIBILITY.md). The source-quality boundary is documented in [ASSUMPTIONS.md](ASSUMPTIONS.md), and release history is in [CHANGELOG.md](CHANGELOG.md).
+
+## Scope boundaries
+
+- One bounded hourly artifact is normalized in memory before bulk persistence.
+- `reject_incoming` preserves history but does not implement a correction/replacement workflow.
+- Remote retrieval, scheduling, dashboards, forecasting, and settlement reconciliation are outside this component.
+- AESO states that CSD values are informational and lower quality than settlement-meter data; this pipeline proves structure, lineage, uniqueness, and internal consistency, not the physical truth of every MW observation.

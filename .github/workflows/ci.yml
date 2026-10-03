@@ -29,5 +29,13 @@ jobs:
       - name: Install pinned dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
+      - name: Install package
+        run: python -m pip install --disable-pip-version-check --no-deps -e .
+
       - name: Run full test suite
         run: python -m pytest
+
+      - name: Smoke-test command-line interfaces
+        run: |
+          aeso-ingest --help
+          aeso-inspect --help
